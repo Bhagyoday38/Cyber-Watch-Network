@@ -1,12 +1,15 @@
 import asyncio
 import hashlib
 import math
+import os
 import random
 import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, UploadFile, File, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, UploadFile, File, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from scapy.all import sniff, IP, TCP, UDP
+from scapy.all import sniff
+# Fixes Pylance dynamic import errors
+from scapy.layers.inet import IP, TCP, UDP
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -33,6 +36,9 @@ SUSPICIOUS_PORTS = {
 }
 
 SCAN_PORTS = {22, 80, 443, 8443, 3306, 5432, 6379, 27017}
+
+# Defined missing variable for the file upload checker
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
 
 
 def classify_packet(packet) -> tuple[str, int, str]:
@@ -121,7 +127,6 @@ SUSPICIOUS_KEYWORDS = {
 
 
 def analyze_file(filename: str, content: bytes) -> dict:
-    import os
     name_lower = filename.lower()
     ext = os.path.splitext(name_lower)[1]
     risk = 0
@@ -221,8 +226,26 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 @app.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
+    # Safeguard against missing or empty filename to appease Pylance
+    if not file.filename:
+        raise HTTPException(
+            status_code=400, detail="Invalid filename provided.")
+
+    filename = file.filename.lower()
+    ext = os.path.splitext(filename)[1]
+
+    # ❌ Reject unwanted file types
+    if ext not in ALLOWED_EXTENSIONS:
+        return {
+            "filename": file.filename,
+            "status": "Rejected",
+            "reason": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"
+        }
+
+    # ✅ Read and analyze allowed files
     content = await file.read()
     result = analyze_file(file.filename, content)
+
     return result
 
 
