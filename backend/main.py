@@ -1,9 +1,8 @@
 import asyncio
-import hashlib
 import math
 import os
-import random
 import threading
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, UploadFile, File, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +13,10 @@ from scapy.layers.inet import IP, TCP, UDP
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
-packet_queue: asyncio.Queue = asyncio.Queue()
+MAX_QUEUED_PACKETS = 256
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
+ALLOWED_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+packet_subscribers: set[asyncio.Queue] = set()
 loop: asyncio.AbstractEventLoop | None = None
 
 # ---------------------------------------------------------------------------
@@ -35,50 +37,82 @@ SUSPICIOUS_PORTS = {
     31337: "Back Orifice",
 }
 
-SCAN_PORTS = {22, 80, 443, 8443, 3306, 5432, 6379, 27017}
+SCAN_WINDOW_SECONDS = 10
+SCAN_PORT_THRESHOLD = 5
+MAX_TRACKED_FLOWS = 4096
+MAX_ATTEMPTS_PER_FLOW = 64
+scan_attempts: OrderedDict[tuple[str, str], deque] = OrderedDict()
 
-# Defined missing variable for the file upload checker
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx"}
 
 
 def classify_packet(packet) -> tuple[str, int, str]:
     """
-    Returns (threat_level, attack_likelihood_pct, threat_type).
+    Returns (threat_level, rule_score, threat_type).
     """
     if not packet.haslayer(TCP) and not packet.haslayer(UDP):
-        return "Normal", random.randint(1, 8), "None"
+        return "Normal", 5, "None"
 
     dst_port = None
-    src_port = None
     if packet.haslayer(TCP):
         dst_port = packet[TCP].dport
-        src_port = packet[TCP].sport
         flags = packet[TCP].flags
 
-        # SYN scan heuristic: SYN-only packets in quick succession
-        if flags == 0x02 and dst_port in SCAN_PORTS:
-            return "Suspicious", random.randint(45, 65), "Port Scan"
+        if packet.haslayer(IP) and flags == 0x02 and _is_port_scan_attempt(packet):
+            return "Suspicious", 55, "Port Scan"
 
         if dst_port in SUSPICIOUS_PORTS:
             label = SUSPICIOUS_PORTS[dst_port]
-            likelihood = random.randint(75, 95)
-            return "Malicious", likelihood, label
+            return "Suspicious", 55, label
 
     elif packet.haslayer(UDP):
         dst_port = packet[UDP].dport
         src_port = packet[UDP].sport
-        # DNS amplification heuristic: large UDP to port 53 from unusual source
-        if dst_port == 53 and len(packet) > 512:
-            return "Suspicious", random.randint(55, 70), "DNS Amplification"
+        if src_port == 53 and len(packet) > 512:
+            return "Suspicious", 60, "Large DNS Response"
 
-    return "Normal", random.randint(1, 12), "None"
+    return "Normal", 5, "None"
+
+
+def _is_port_scan_attempt(packet) -> bool:
+    # shortcut: detects vertical TCP SYN scans only; cross-destination tracking is needed for horizontal scans.
+    flow = (packet[IP].src, packet[IP].dst)
+    attempts = scan_attempts.get(flow)
+    if attempts is None:
+        attempts = deque()
+        scan_attempts[flow] = attempts
+        if len(scan_attempts) > MAX_TRACKED_FLOWS:
+            scan_attempts.popitem(last=False)
+    else:
+        scan_attempts.move_to_end(flow)
+
+    packet_time = float(packet.time)
+    while attempts and packet_time - attempts[0][0] > SCAN_WINDOW_SECONDS:
+        attempts.popleft()
+    if len(attempts) >= MAX_ATTEMPTS_PER_FLOW:
+        attempts.popleft()
+
+    attempts.append((packet_time, packet[TCP].dport))
+    return len({port for _, port in attempts}) >= SCAN_PORT_THRESHOLD
+
+
+def publish_packet(packet_data: dict):
+    for subscriber in tuple(packet_subscribers):
+        if subscriber.full():
+            # Keep each browser current without growing memory for slow clients.
+            subscriber.get_nowait()
+        subscriber.put_nowait(packet_data)
+
+
+def is_allowed_origin(origin: str | None) -> bool:
+    return origin is None or origin in ALLOWED_ORIGINS
 
 
 def packet_callback(packet):
     if not packet.haslayer(IP):
         return
 
-    threat_level, attack_likelihood, threat_type = classify_packet(packet)
+    threat_level, rule_score, threat_type = classify_packet(packet)
 
     protocol = (
         "TCP" if packet.haslayer(TCP)
@@ -101,11 +135,11 @@ def packet_callback(packet):
         "dst_port": dst_port,
         "threat": threat_level,
         "threat_type": threat_type,
-        "attack_likelihood": f"{attack_likelihood}%",
+        "rule_score": rule_score,
     }
 
     if loop is not None and loop.is_running():
-        loop.call_soon_threadsafe(packet_queue.put_nowait, packet_data)
+        loop.call_soon_threadsafe(publish_packet, packet_data)
 
 
 def start_sniffing():
@@ -153,15 +187,15 @@ def analyze_file(filename: str, content: bytes) -> dict:
         elif entropy > 6.5:
             risk += 8
 
-    # Magic bytes for executables regardless of extension
+    # Executables disguised as documents must never receive a safe verdict.
     if content[:2] == b"MZ":
-        risk += 25
+        risk = max(risk, 90)
         if "Executable extension" not in str(flags):
             flags.append("PE executable magic bytes (MZ header)")
 
     # Clamp to [0, 100]
     risk = min(risk, 100)
-    status = "Malicious" if risk >= 60 else "Suspicious" if risk >= 30 else "Safe"
+    status = "Malicious" if risk >= 60 else "Suspicious" if risk >= 30 else "No known indicators"
 
     return {
         "filename": filename,
@@ -182,6 +216,13 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
 
+def validate_upload_content(content: bytes):
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File exceeds the 50 MB limit.")
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -199,9 +240,9 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=list(ALLOWED_ORIGINS),
+    allow_methods=["POST"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -210,15 +251,20 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/packets")
 async def websocket_endpoint(websocket: WebSocket):
+    if not is_allowed_origin(websocket.headers.get("origin")):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
+    subscriber = asyncio.Queue(maxsize=MAX_QUEUED_PACKETS)
+    packet_subscribers.add(subscriber)
     try:
         while True:
-            packet = await packet_queue.get()
+            packet = await subscriber.get()
             await websocket.send_json(packet)
     except WebSocketDisconnect:
-        print("WebSocket client disconnected.")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
+        pass
+    finally:
+        packet_subscribers.discard(subscriber)
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +272,6 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 @app.post("/upload-file")
 async def upload_file(file: UploadFile = File(...)):
-    # Safeguard against missing or empty filename to appease Pylance
     if not file.filename:
         raise HTTPException(
             status_code=400, detail="Invalid filename provided.")
@@ -234,16 +279,14 @@ async def upload_file(file: UploadFile = File(...)):
     filename = file.filename.lower()
     ext = os.path.splitext(filename)[1]
 
-    # ❌ Reject unwanted file types
     if ext not in ALLOWED_EXTENSIONS:
-        return {
-            "filename": file.filename,
-            "status": "Rejected",
-            "reason": "Only PDF, DOC, DOCX, PPT, PPTX files are allowed"
-        }
+        raise HTTPException(
+            status_code=415,
+            detail="Only PDF, DOC, DOCX, PPT, and PPTX files are supported.",
+        )
 
-    # ✅ Read and analyze allowed files
-    content = await file.read()
+    content = await file.read(MAX_UPLOAD_SIZE + 1)
+    validate_upload_content(content)
     result = analyze_file(file.filename, content)
 
     return result
@@ -254,4 +297,4 @@ async def upload_file(file: UploadFile = File(...)):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
